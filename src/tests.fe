@@ -1,0 +1,349 @@
+// Run the tests with `fe test`.
+//
+// The Fe test EVM calls every message from the test account
+// (`evm.address()`), which is also the deployer — so in these tests the
+// test account plays the owner, and in the happy paths it is also the
+// session agent. Mismatch cases (wrong agent) are covered by opening a
+// session for a *different* agent address and watching the spend revert.
+
+use ingot::{SpendGuard, SpendGuardMsg}
+use std::evm::{days, ether}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn create_session_and_spend_within_cap() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+
+    let deposited: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    assert!(deposited == ether(2))
+
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    assert!(session == 0)
+
+    let payee = Address::new(0x1234)
+    let allowed: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    assert!(allowed)
+
+    let is_allowed: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::IsAllowed { session, target: payee },
+        )
+    assert!(is_allowed)
+
+    let spent_amount: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+    assert!(spent_amount == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+
+    let total_spent: Wei = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::SessionSpent { session },
+        )
+    assert!(total_spent == ether(1))
+
+    let remaining: Wei = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Remaining { session },
+        )
+    assert!(remaining == Wei::zero())
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn spend_above_cap_reverts() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    let payee = Address::new(0x1234)
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    // 2 ETH against a 1 ETH cap: the cap check must reject it.
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(2) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn cap_accumulates_across_spends() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(3),
+            message: SpendGuardMsg::Deposit {},
+        )
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    let payee = Address::new(0x1234)
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    // First spend consumes the whole cap...
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+    // ...so even a second spend of the same size must revert: the cap is
+    // cumulative, not per-payment.
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn spend_to_unallowed_target_reverts() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    // No AllowTarget call: the payee is not on this session's allowlist.
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: Address::new(0x1234), amount: ether(1) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn spend_after_expiry_reverts() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    // A zero-length session expires at the current timestamp, so the
+    // expiry check (now < expiry) fails immediately.
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: Duration::zero(),
+            },
+        )
+    let payee = Address::new(0x1234)
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn spend_by_non_agent_reverts() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    // The session belongs to a different agent; the caller (the test
+    // account / owner) must not be able to spend from it.
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: Address::new(0xBEEF),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    let payee = Address::new(0x1234)
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn spend_after_close_reverts() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    let session: u256 = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CreateSession {
+                agent: evm.address(),
+                cap: ether(1),
+                valid_for: days(1),
+            },
+        )
+    let payee = Address::new(0x1234)
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::AllowTarget { session, target: payee },
+        )
+    let _: bool = evm
+        .call(
+            addr: guard,
+            gas: 100000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::CloseSession { session },
+        )
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Spend { session, to: payee, amount: ether(1) },
+        )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn owner_withdraws_unspent_funds() uses (evm: mut Evm) {
+    let guard = evm.create2<SpendGuard>(value: Wei::zero(), args: (), salt: 0)
+    let _: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: ether(2),
+            message: SpendGuardMsg::Deposit {},
+        )
+    let payee = Address::new(0x1234)
+    let withdrawn: Wei = evm
+        .call(
+            addr: guard,
+            gas: 200000,
+            value: Wei::zero(),
+            message: SpendGuardMsg::Withdraw { to: payee, amount: ether(2) },
+        )
+    assert!(withdrawn == ether(2))
+    assert!(evm.balance(payee) == ether(2))
+}

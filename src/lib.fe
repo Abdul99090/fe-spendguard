@@ -1,0 +1,286 @@
+// SpendGuard: scoped spending sessions for autonomous agents.
+//
+// An owner (a human or a treasury) funds this contract once, then opens
+// *sessions* for individual agents. Each session has:
+//   - a spending cap (total Wei the agent may spend over the session),
+//   - an expiry (the session dies at a fixed timestamp),
+//   - a target allowlist (the only addresses the agent may pay).
+//
+// The agent can then pay allowlisted targets through `spend` without ever
+// holding the owner's keys or an unbounded allowance: the contract enforces
+// cap + allowlist + expiry on every payment, in that order, and updates the
+// spent total *before* sending value (checks-effects-interactions).
+//
+// Written in Fe 26.5. See README.md for the design notes and DECLARATION.md
+// for the contest declarations (pre-existing work / third-party code / AI
+// assistance).
+
+use std::evm::StorageMap
+
+msg SpendGuardMsg {
+    #[selector = sol("deposit()")]
+    Deposit -> Wei,
+    #[selector = sol("createSession(address,uint256,uint256)")]
+    CreateSession { agent: Address, cap: Wei, valid_for: Duration } -> u256,
+    #[selector = sol("allowTarget(uint256,address)")]
+    AllowTarget { session: u256, target: Address } -> bool,
+    #[selector = sol("revokeTarget(uint256,address)")]
+    RevokeTarget { session: u256, target: Address } -> bool,
+    #[selector = sol("closeSession(uint256)")]
+    CloseSession { session: u256 } -> bool,
+    #[selector = sol("spend(uint256,address,uint256)")]
+    Spend { session: u256, to: Address, amount: Wei } -> Wei,
+    #[selector = sol("withdraw(address,uint256)")]
+    Withdraw { to: Address, amount: Wei } -> Wei,
+    #[selector = sol("owner()")]
+    Owner -> Address,
+    #[selector = sol("sessionCount()")]
+    SessionCount -> u256,
+    #[selector = sol("sessionAgent(uint256)")]
+    SessionAgent { session: u256 } -> Address,
+    #[selector = sol("sessionCap(uint256)")]
+    SessionCap { session: u256 } -> Wei,
+    #[selector = sol("sessionSpent(uint256)")]
+    SessionSpent { session: u256 } -> Wei,
+    #[selector = sol("sessionExpiry(uint256)")]
+    SessionExpiry { session: u256 } -> Timestamp,
+    #[selector = sol("sessionActive(uint256)")]
+    SessionActive { session: u256 } -> bool,
+    #[selector = sol("isAllowed(uint256,address)")]
+    IsAllowed { session: u256, target: Address } -> bool,
+    #[selector = sol("remaining(uint256)")]
+    Remaining { session: u256 } -> Wei,
+}
+
+#[event]
+struct Deposited {
+    #[indexed]
+    owner: Address,
+    amount: Wei,
+}
+
+#[event]
+struct SessionCreated {
+    #[indexed]
+    session: u256,
+    #[indexed]
+    agent: Address,
+    cap: Wei,
+    expiry: Timestamp,
+}
+
+#[event]
+struct TargetAllowed {
+    #[indexed]
+    session: u256,
+    #[indexed]
+    target: Address,
+}
+
+#[event]
+struct TargetRevoked {
+    #[indexed]
+    session: u256,
+    #[indexed]
+    target: Address,
+}
+
+#[event]
+struct SessionClosed {
+    #[indexed]
+    session: u256,
+}
+
+#[event]
+struct Spent {
+    #[indexed]
+    session: u256,
+    #[indexed]
+    agent: Address,
+    to: Address,
+    amount: Wei,
+    total_spent: Wei,
+}
+
+#[event]
+struct Withdrawn {
+    #[indexed]
+    to: Address,
+    amount: Wei,
+}
+
+pub contract SpendGuard uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    owner: Address,
+    mut next_id: u256,
+    mut agents: StorageMap<u256, Address>,
+    mut caps: StorageMap<u256, Wei>,
+    mut spents: StorageMap<u256, Wei>,
+    mut expiries: StorageMap<u256, Timestamp>,
+    mut actives: StorageMap<u256, bool>,
+    mut allowed: StorageMap<(u256, Address), bool>,
+
+    init()
+    uses (ctx, mut owner, mut next_id)
+    {
+        owner = ctx.caller()
+        next_id = 0
+    }
+
+    recv SpendGuardMsg {
+        // Fund the guard. Only the owner may top it up, so the funding
+        // source is always the same accountable account.
+        #[payable]
+        Deposit -> Wei uses (ctx, owner, mut log) {
+            assert!(ctx.caller() == owner, "Only the owner can fund")
+            let amount = ctx.value()
+            assert!(amount > Wei::zero(), "Nothing to deposit")
+            log.emit(Deposited { owner, amount })
+            amount
+        }
+
+        // Open a session for one agent. The cap is the *total* the agent
+        // may spend before `expiry`; it is not a per-payment limit.
+        CreateSession { agent, cap, valid_for } -> u256
+        uses (
+            ctx,
+            owner,
+            mut next_id,
+            mut agents,
+            mut caps,
+            mut spents,
+            mut expiries,
+            mut actives,
+            mut log,
+        )
+        {
+            assert!(ctx.caller() == owner, "Only the owner opens sessions")
+            assert!(cap > Wei::zero(), "Cap must be positive")
+
+            let id = next_id
+            let expiry = ctx.timestamp() + valid_for
+            agents.set(key: id, value: agent)
+            caps.set(key: id, value: cap)
+            spents.set(key: id, value: Wei::zero())
+            expiries.set(key: id, value: expiry)
+            actives.set(key: id, value: true)
+            next_id = id + 1
+            log.emit(SessionCreated { session: id, agent, cap, expiry })
+            id
+        }
+
+        AllowTarget { session, target } -> bool uses (ctx, owner, mut allowed, mut log) {
+            assert!(ctx.caller() == owner, "Only the owner edits allowlists")
+            allowed.set(key: (session, target), value: true)
+            log.emit(TargetAllowed { session, target })
+            true
+        }
+
+        RevokeTarget { session, target } -> bool uses (ctx, owner, mut allowed, mut log) {
+            assert!(ctx.caller() == owner, "Only the owner edits allowlists")
+            allowed.set(key: (session, target), value: false)
+            log.emit(TargetRevoked { session, target })
+            true
+        }
+
+        // Closing is permanent for the session id; open a new session
+        // instead of reopening (ids are never reused).
+        CloseSession { session } -> bool uses (ctx, owner, mut actives, mut log) {
+            assert!(ctx.caller() == owner, "Only the owner closes sessions")
+            actives.set(key: session, value: false)
+            log.emit(SessionClosed { session })
+            true
+        }
+
+        // The agent pays an allowlisted target out of the guard's balance.
+        // Every guardrail is checked before any value moves, and the spent
+        // total is updated before the external send.
+        Spend { session, to, amount } -> Wei uses (
+            ctx,
+            mut call,
+            agents,
+            caps,
+            mut spents,
+            expiries,
+            actives,
+            allowed,
+            mut log,
+        ) {
+            assert!(amount > Wei::zero(), "Nothing to spend")
+            assert!(actives.get(key: session), "Session is not active")
+            let agent = agents.get(key: session)
+            assert!(ctx.caller() == agent, "Caller is not the session agent")
+            assert!(
+                allowed.get(key: (session, to)),
+                "Target is not allowlisted",
+            )
+            assert!(
+                ctx.timestamp() < expiries.get(key: session),
+                "Session expired",
+            )
+
+            let new_total = spents.get(key: session) + amount
+            assert!(
+                new_total <= caps.get(key: session),
+                "Session cap exceeded",
+            )
+            spents.set(key: session, value: new_total)
+
+            assert!(
+                call.send_value(addr: to, gas: 0, value: amount).success(),
+                "Transfer failed",
+            )
+            log.emit(
+                Spent { session, agent, to, amount, total_spent: new_total },
+            )
+            amount
+        }
+
+        // The owner can always reclaim funds that no session has spent.
+        Withdraw { to, amount } -> Wei uses (ctx, owner, mut call, mut log) {
+            assert!(ctx.caller() == owner, "Only the owner withdraws")
+            assert!(amount > Wei::zero(), "Nothing to withdraw")
+            assert!(
+                call.send_value(addr: to, gas: 0, value: amount).success(),
+                "Transfer failed",
+            )
+            log.emit(Withdrawn { to, amount })
+            amount
+        }
+
+        Owner -> Address uses (owner) {
+            owner
+        }
+
+        SessionCount -> u256 uses (next_id) {
+            next_id
+        }
+
+        SessionAgent { session } -> Address uses (agents) {
+            agents.get(key: session)
+        }
+
+        SessionCap { session } -> Wei uses (caps) {
+            caps.get(key: session)
+        }
+
+        SessionSpent { session } -> Wei uses (spents) {
+            spents.get(key: session)
+        }
+
+        SessionExpiry { session } -> Timestamp uses (expiries) {
+            expiries.get(key: session)
+        }
+
+        SessionActive { session } -> bool uses (actives) {
+            actives.get(key: session)
+        }
+
+        IsAllowed { session, target } -> bool uses (allowed) {
+            allowed.get(key: (session, target))
+        }
+
+        Remaining { session } -> Wei uses (caps, spents) {
+            caps.get(key: session) - spents.get(key: session)
+        }
+    }
+}
